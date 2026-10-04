@@ -4,7 +4,7 @@ services:
   bot:
     build:
       context: ..
-      dockerfile: bot/Dockerfile
+      dockerfile: ../Dockerfile
     image: luraph-bot:latest
     command: python bot.py
     env_file: .env
@@ -22,7 +22,7 @@ services:
   worker:
     build:
       context: ..
-      dockerfile: bot/Dockerfile
+      dockerfile: ../Dockerfile
     image: luraph-bot:latest
     command: python worker.py
     environment:
