@@ -1,0 +1,54 @@
+name: luraph-bot
+
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: bot/Dockerfile
+    image: luraph-bot:latest
+    command: python bot.py
+    env_file: .env
+    environment:
+      JOBS_DIR: /jobs
+    volumes:
+      - jobs:/jobs
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  worker:
+    build:
+      context: ..
+      dockerfile: bot/Dockerfile
+    image: luraph-bot:latest
+    command: python worker.py
+    environment:
+      JOBS_DIR: /jobs
+      TMPDIR: /tmp
+      DEOB_DIR: /app/deobf
+    volumes:
+      - jobs:/jobs
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=4g,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 8g
+    memswap_limit: 8g
+    cpus: "4.0"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  jobs:

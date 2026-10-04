@@ -1,0 +1,9 @@
+.env
+jobs/
+output/
+__pycache__/
+*.pyc
+*.deobf.luau
+*.devirt.luau
+*.harness.luau
+*.studio_loader.luau
