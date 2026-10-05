@@ -4,8 +4,7 @@ runs one container per service and can't share a /jobs volume between
 two services.
 
 Runs the worker's job loop in a background thread and the Discord bot in
-the main thread. If either dies, the container exits and the platform
-restarts it.
+the main thread.
 """
 
 from __future__ import annotations
