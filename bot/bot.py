@@ -2,24 +2,16 @@
 Discord bot for the Luraph deobfuscator — prefix commands, auto-detect.
 
 Usage (prefix is `.lph`):
-    .lph <attachment>          run the deobfuscator on an attached file
-    .lph <url>                 same, but download the file from a URL
-    .lph detect <attachment>   only scan the header
-    .lph detect <url>
-    .lph help                  show usage
-    .lph ping                  health check
-    .lph stats                 queue depth and uptime
+    .lph <attachment>              deobfuscate an attached file
+    .lph <url>                     download and deobfuscate
+    .lph                           then paste the script on the following
+                                   line(s) — deobfuscate pasted text
+    .lph detect <attachment|url>   scan the header only
+    .lph help
+    .lph ping
+    .lph stats
 
-The version is auto-detected from the Luraph banner in the file header
-(scanner.py), and the dispatcher picks the right front end:
-
-    v14.7 / v14.8 / v14.9   ->  cli.py --engine 14.x
-    v14.0 .. v14.6, v14     ->  cli.py --engine auto
-    v15 / v15.x             ->  deob.py --obfuscator luraph_v15
-
-Accepted extensions: .lua .luau .lph .txt
-URL fetching is SSRF-guarded (only http/https, only public IPs,
-manual redirect checks). No size cap.
+The version is auto-detected from the Luraph banner.
 """
 
 from __future__ import annotations
@@ -29,6 +21,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 import socket
 import time
 import uuid
@@ -52,7 +45,6 @@ OUT.mkdir(parents=True, exist_ok=True)
 PREFIX = os.environ.get("PREFIX", ".lph")
 
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", 600))
-ALLOWED_CHANNEL = os.environ.get("ALLOWED_CHANNEL_ID") or None
 STARTED_AT = time.time()
 
 ALLOWED_SUFFIXES = (".lua", ".luau", ".lph", ".txt")
@@ -71,6 +63,33 @@ ALLOWED_SCHEMES = {"http", "https"}
 USER_COOLDOWN = 10.0
 _last_run: dict[int, float] = {}
 
+# ---------------------------------------------------------------- channel lock
+
+_OPEN_TOKENS = {"", "any", "all", "*", "none", "null", "0"}
+
+
+def _parse_channel_lock(raw: str | None) -> set[int] | None:
+    if not raw:
+        return None
+    s = raw.strip().lower()
+    if s in _OPEN_TOKENS:
+        return None
+    ids: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part or part.lower() in _OPEN_TOKENS:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            print(f"[bot] ignoring bad ALLOWED_CHANNEL_ID entry: {part!r}", flush=True)
+    return ids or None
+
+
+ALLOWED_CHANNELS: set[int] | None = _parse_channel_lock(
+    os.environ.get("ALLOWED_CHANNEL_ID")
+)
+
 # ---------------------------------------------------------------- client
 
 intents = discord.Intents.default()
@@ -88,7 +107,9 @@ def _queue_depth() -> int:
 
 
 def _channel_ok(message: discord.Message) -> bool:
-    return ALLOWED_CHANNEL is None or str(message.channel.id) == ALLOWED_CHANNEL
+    if ALLOWED_CHANNELS is None:
+        return True
+    return message.channel.id in ALLOWED_CHANNELS
 
 
 def _bad_ext(name: str) -> bool:
@@ -177,9 +198,6 @@ def _safe_url(url: str) -> tuple[bool, str]:
 
 
 async def _fetch_url(url: str) -> tuple[bytes | None, str, str]:
-    """
-    Returns (data, error, final_url). No size cap — reads the whole body.
-    """
     timeout = aiohttp.ClientTimeout(total=URL_TIMEOUT, connect=10)
     headers = {"User-Agent": "luraph-bot/1.0"}
     current = url
@@ -212,8 +230,57 @@ async def _fetch_url(url: str) -> tuple[bytes | None, str, str]:
 
 
 def _looks_like_url(s: str) -> bool:
-    low = s.lower()
+    low = s.lstrip().lower()
     return low.startswith("http://") or low.startswith("https://")
+
+
+# ---------------------------------------------------------------- inline source
+
+BANNER_HINT = re.compile(
+    r"^\s*--?\s*.*?This\s+file\s+was\s+protected\s+using\s+Luraph",
+    re.IGNORECASE | re.MULTILINE,
+)
+CODE_FENCE_OPEN = re.compile(r"^```[A-Za-z0-9_+-]*\s*$")
+CODE_FENCE_ANY = re.compile(r"^```\s*$")
+
+
+def _strip_code_fences(text: str) -> str:
+    lines = text.split("\n")
+    while lines and CODE_FENCE_OPEN.match(lines[0]):
+        lines = lines[1:]
+    while lines and CODE_FENCE_ANY.match(lines[-1]):
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
+def _extract_inline_source(text: str) -> str | None:
+    """Return the pasted script if `text` looks like one, else None."""
+    if not text:
+        return None
+
+    stripped = _strip_code_fences(text.strip())
+
+    m = BANNER_HINT.search(stripped)
+    if m:
+        body = stripped[m.start():]
+    else:
+        body = stripped
+
+    body = _strip_code_fences(body).rstrip()
+    if not body:
+        return None
+
+    head = body.lstrip()
+    if not (
+        "This file was protected using Luraph" in body
+        or head.startswith("return(function")
+        or head.startswith("return function")
+        or head.startswith("return (function")
+        or head.startswith("local ")
+    ):
+        return None
+
+    return body
 
 
 # ---------------------------------------------------------------- source extraction
@@ -222,8 +289,17 @@ class SourceError(Exception):
     pass
 
 
-async def _resolve_source(message: discord.Message, arg: str | None) -> tuple[bytes, str]:
-    """Return (data, original_name) or raise SourceError."""
+async def _resolve_source(
+    message: discord.Message,
+    source_text: str | None,
+) -> tuple[bytes, str]:
+    """
+    Priority:
+        1. attachment
+        2. URL in `source_text`
+        3. inline pasted code in `source_text`
+    """
+    # 1) attachment
     if message.attachments:
         att = message.attachments[0]
         if _bad_ext(att.filename):
@@ -236,11 +312,13 @@ async def _resolve_source(message: discord.Message, arg: str | None) -> tuple[by
             raise SourceError(f"failed to download the attachment: `{e}`") from e
         return data, att.filename
 
-    if arg and _looks_like_url(arg):
-        ok, err = _safe_url(arg)
+    # 2) URL
+    if source_text and _looks_like_url(source_text):
+        first_token = source_text.split()[0]
+        ok, err = _safe_url(first_token)
         if not ok:
             raise SourceError(err)
-        data, err, final_url = await _fetch_url(arg)
+        data, err, final_url = await _fetch_url(first_token)
         if data is None:
             raise SourceError(err)
         parsed = urlparse(final_url)
@@ -253,9 +331,15 @@ async def _resolve_source(message: discord.Message, arg: str | None) -> tuple[by
             tail = (stem or "downloaded") + ".luau"
         return data, tail
 
+    # 3) inline pasted code
+    if source_text:
+        body = _extract_inline_source(source_text)
+        if body:
+            return body.encode("utf-8", "replace"), "pasted.luau"
+
     raise SourceError(
-        "attach a file or paste a direct `http(s)://` link.\n"
-        f"usage: `{PREFIX} <file|url>` — try `{PREFIX} help`"
+        "attach a file, paste a direct `http(s)://` link, "
+        "or paste the script text itself (in a code block or raw)."
     )
 
 
@@ -354,12 +438,15 @@ HELP_TEXT = (
     f"**luraph deobfuscator**\n"
     f"`{PREFIX} <attachment>` — deobfuscate an attached file\n"
     f"`{PREFIX} <url>` — deobfuscate a file at a direct http(s) link\n"
-    f"`{PREFIX} detect <attachment|url>` — scan the header only\n"
+    f"`{PREFIX}` then paste the script on the next line(s) — deobfuscate pasted text\n"
+    f"`{PREFIX} detect <attachment|url|text>` — scan the header only\n"
     f"`{PREFIX} help` — this message\n"
     f"`{PREFIX} ping` — health check\n"
     f"`{PREFIX} stats` — queue depth and uptime\n\n"
-    f"accepted: `{', '.join(ALLOWED_SUFFIXES)}`\n"
-    f"version is auto-detected from the file header — no engine argument needed."
+    f"accepted extensions: `{', '.join(ALLOWED_SUFFIXES)}`\n"
+    f"version is auto-detected from the file header — no engine argument needed.\n"
+    f"*Pasted text is limited by Discord's message size (2000 chars, "
+    f"4000 with Nitro) — larger scripts must be attached or hosted.*"
 )
 
 
@@ -373,7 +460,7 @@ async def on_message(message: discord.Message):
     if not _channel_ok(message):
         try:
             await message.reply(
-                "this command is locked to another channel.",
+                "this command is not allowed in this channel.",
                 mention_author=False,
                 delete_after=10,
             )
@@ -382,31 +469,46 @@ async def on_message(message: discord.Message):
         return
 
     rest = message.content[len(PREFIX):].strip()
-    parts = rest.split(maxsplit=1)
-    sub = parts[0].lower() if parts else ""
-    arg = parts[1].strip() if len(parts) > 1 else None
+    first_token = rest.split(maxsplit=1)[0].lower() if rest else ""
 
-    if sub in ("help", "", "h"):
+    if not rest or first_token in ("help", "h"):
         await message.reply(HELP_TEXT, mention_author=False)
         return
 
-    if sub == "ping":
+    if first_token == "ping":
         await message.reply("alive", mention_author=False)
         return
 
-    if sub == "stats":
+    if first_token == "stats":
         up = time.time() - STARTED_AT
         hours, rem = divmod(int(up), 3600)
         minutes, seconds = divmod(rem, 60)
         embed = discord.Embed(title="luraph-bot stats", color=0x5865F2)
         embed.add_field(name="Queue", value=f"{_queue_depth()} pending", inline=True)
         embed.add_field(name="Uptime", value=f"{hours}h {minutes}m {seconds}s", inline=True)
+        embed.add_field(
+            name="Channels",
+            value="any" if ALLOWED_CHANNELS is None else f"{len(ALLOWED_CHANNELS)} locked",
+            inline=True,
+        )
         await message.reply(embed=embed, mention_author=False)
         return
 
     detect_only = False
-    if sub == "detect":
+    source_text = rest
+    if first_token == "detect":
         detect_only = True
+        source_text = rest[len("detect"):].strip()
+
+    has_attachment = bool(message.attachments)
+
+    if not has_attachment and not source_text:
+        await message.reply(
+            f"nothing to deobfuscate — attach a file, paste a URL, "
+            f"or paste the script text.\ntry `{PREFIX} help`",
+            mention_author=False,
+        )
+        return
 
     left = _cooldown_left(message.author.id)
     if left > 0.5:
@@ -426,7 +528,7 @@ async def on_message(message: discord.Message):
         return
 
     try:
-        data, name = await _resolve_source(message, arg)
+        data, name = await _resolve_source(message, source_text)
     except SourceError as e:
         await message.reply(str(e), mention_author=False)
         return
@@ -465,16 +567,30 @@ async def on_message(message: discord.Message):
 
 # ---------------------------------------------------------------- lifecycle
 
-@client.event
+@client.once
 async def on_ready():
+    if ALLOWED_CHANNELS is None:
+        lock = "open to ALL channels"
+    else:
+        lock = f"locked to {sorted(ALLOWED_CHANNELS)}"
     print(f"[bot] logged in as {client.user} ({client.user.id})", flush=True)
-    print(f"[bot] prefix = {PREFIX!r}, watching {IN}, results in {OUT}", flush=True)
+    print(f"[bot] prefix = {PREFIX!r}, {lock}", flush=True)
+    print(f"[bot] watching {IN}, results in {OUT}", flush=True)
 
 
 def main() -> None:
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise SystemExit("DISCORD_TOKEN is not set")
+    token = token.strip()
+    if token.startswith("Bot "):
+        token = token[4:].strip()
+    if token.count(".") != 2:
+        raise SystemExit(
+            "DISCORD_TOKEN does not look like a bot token "
+            "(expected three dot-separated parts). Reset the token in the "
+            "Discord Developer Portal and paste it exactly, no quotes."
+        )
     client.run(token, log_handler=None)
 
 
