@@ -8,7 +8,7 @@ Job JSON:
       "id": "abc123",
       "input": "/jobs/in/abc123.luau",
       "engine": "14.7" | "luraph_v15" | null,
-      "mode": "full" | "trace" | "detect",
+      "mode": "full" | "trace" | "strings" | "detect",
       "original_name": "sample.luau"
     }
 
