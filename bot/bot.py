@@ -6,6 +6,7 @@ Usage (prefix is `.lph`):
     .lph <url>                     download and deobfuscate
     .lph                           then paste the script on the next line(s)
     .lph trace <attachment|url>    behavior-trace only (faster, less complete)
+    .lph strings <attachment|url>  strings dump + trace fallback
     .lph detect <attachment|url>   scan the header only
     .lph help
     .lph ping
@@ -149,6 +150,14 @@ def _human_size(n: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TiB"
+
+
+def _mode_label(mode: str) -> str:
+    return {
+        "full": "full devirtualization",
+        "trace": "behavior trace only",
+        "strings": "strings dump + trace fallback",
+    }.get(mode, mode)
 
 
 # ---------------------------------------------------------------- SSRF
@@ -362,12 +371,11 @@ async def _run_job(
     note = describe_dispatch(info, None)
     header_line = info.get("banner") or "(no banner)"
 
-    mode_label = "full devirtualization" if mode == "full" else "behavior trace only"
     status = (
         f"**Detected:** {_scan_summary(info)}\n"
         f"**Banner:** `{header_line[:200]}`\n"
         f"**Input:** `{original_name}` ({_human_size(len(data))})\n"
-        f"**Mode:** {mode_label}\n"
+        f"**Mode:** {_mode_label(mode)}\n"
         f"**Dispatch:** {note}"
     )
     await message.reply(status, mention_author=False)
@@ -409,13 +417,20 @@ async def _run_job(
 
         if res.get("error"):
             body = res["error"][:1600]
-            hint = (
-                ""
-                if mode == "trace"
-                else f"\n\nTip: try `{PREFIX} trace <same source>` for a "
-                     f"behavior-trace-only run (faster, sometimes succeeds when "
-                     f"full devirtualization fails)."
-            )
+            hint = ""
+            if mode == "full":
+                hint = (
+                    f"\n\nTips:\n"
+                    f"• `{PREFIX} trace <same source>` — behavior trace only "
+                    f"(skips devirtualization entirely)\n"
+                    f"• `{PREFIX} strings <same source>` — attempt devirt but "
+                    f"fall back to strings + trace if it can't finish"
+                )
+            elif mode == "strings":
+                hint = (
+                    f"\n\nTip: try `{PREFIX} trace <same source>` — pure "
+                    f"behavior trace, no devirt attempt."
+                )
             await message.reply(
                 f"deobfuscation failed:\n```\n{body}\n```{hint}",
                 mention_author=False,
@@ -454,6 +469,7 @@ HELP_TEXT = (
     f"`{PREFIX} <url>` — same, but download from an http(s) link\n"
     f"`{PREFIX}` then paste the script on the next line(s) — deobfuscate pasted text\n"
     f"`{PREFIX} trace <attachment|url>` — behavior trace only (fast, less complete)\n"
+    f"`{PREFIX} strings <attachment|url>` — strings dump + trace fallback\n"
     f"`{PREFIX} detect <attachment|url|text>` — scan the header only\n"
     f"`{PREFIX} help` — this message\n"
     f"`{PREFIX} ping` — health check\n"
@@ -522,6 +538,9 @@ async def on_message(message: discord.Message):
     elif first_token == "trace":
         mode = "trace"
         source_text = rest[len("trace"):].strip()
+    elif first_token == "strings":
+        mode = "strings"
+        source_text = rest[len("strings"):].strip()
 
     # Bare ".lph" with no attachment -> help. With attachment -> process it.
     if not rest and not has_attachment:
