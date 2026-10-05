@@ -581,8 +581,15 @@ async def on_message(message: discord.Message):
 
 # ---------------------------------------------------------------- lifecycle
 
-@client.once
+_ready_logged = False
+
+
+@client.event
 async def on_ready():
+    global _ready_logged
+    if _ready_logged:
+        return
+    _ready_logged = True
     if ALLOWED_CHANNELS is None:
         lock = "open to ALL channels"
     else:
