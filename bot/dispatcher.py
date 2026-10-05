@@ -21,10 +21,7 @@ DEOB_DIR = Path("/app/deobf")
 CLI_PY = DEOB_DIR / "cli.py"
 DEOB_PY = DEOB_DIR / "deob.py"
 
-# exact v14.x with a dedicated engine in cli.py
 V14_EXACT_RE = re.compile(r"^v?14\.(7|8|9)$")
-
-# bare major / major.minor we recognize
 V14_ANY_RE = re.compile(r"^v?14(?:\.\d+)?$")
 V15_ANY_RE = re.compile(r"^v?15(?:\.\d+)?$")
 
@@ -40,7 +37,6 @@ def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
 
 
 def detect_obfuscator(input_path: Path) -> str | None:
-    """Return the plugin name deob.py detects, or None."""
     try:
         p = _run([sys.executable, str(DEOB_PY), str(input_path), "--detect"], timeout=30)
     except subprocess.TimeoutExpired:
@@ -63,21 +59,41 @@ def _resolve_engine(input_path: Path, explicit: str | None) -> tuple[str | None,
 
 
 def _frontend_for(engine: str, mode: str) -> tuple[Path, list[str]]:
+    """
+    mode: "full" | "trace" | "strings"
+
+    full    -> dedicated engine, --trace-fallback on v14 (mapper often can't
+               find closure makers on unusual layouts; --trace-fallback means
+               we still get a behavior trace instead of a hard failure)
+    trace   -> --no-devirt (skips the mapper entirely)
+    strings -> --strings --trace-fallback (dump recovered strings; keep whatever
+               trace exists even if devirt can't finish)
+    """
     extra: list[str] = []
+
     if mode == "trace":
         extra.append("--no-devirt")
+    elif mode == "strings":
+        extra.append("--strings")
+        extra.append("--trace-fallback")
 
     e = engine.strip().lower()
 
     # v14.7 / 14.8 / 14.9 -> dedicated engine
     if V14_EXACT_RE.match(e):
-        return CLI_PY, ["--engine", e.lstrip("v"), *extra]
+        args = ["--engine", e.lstrip("v"), *extra]
+        if mode == "full":
+            args.append("--trace-fallback")
+        return CLI_PY, args
 
-    # bare "14", "14.0".."14.6", or the scanner's "auto" -> cli.py auto-detect
+    # bare "14", "14.0".."14.6", or the scanner's "auto"
     if e == "auto" or V14_ANY_RE.match(e):
-        return CLI_PY, ["--engine", "auto", *extra]
+        args = ["--engine", "auto", *extra]
+        if mode == "full":
+            args.append("--trace-fallback")
+        return CLI_PY, args
 
-    # 15, 15.0, 15.1, ... -> v15 plugin
+    # 15, 15.0, 15.1, ...
     if e in ("v15", "15", "luraph_v15", "luraphv15") or V15_ANY_RE.match(e):
         return DEOB_PY, ["--obfuscator", "luraph_v15", *extra]
 
@@ -105,10 +121,6 @@ def plan(input_path: Path, engine: str | None, mode: str) -> tuple[Path, list[st
 
 
 def describe_dispatch(scan_info: dict, engine: str | None) -> str:
-    """
-    One-line description of what will actually run, for the bot's status
-    message. Handles the "detected 14.4 but no dedicated engine" case.
-    """
     if engine:
         return f"engine forced to `{engine}`"
 
