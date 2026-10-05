@@ -2,10 +2,10 @@
 Discord bot for the Luraph deobfuscator — prefix commands, auto-detect.
 
 Usage (prefix is `.lph`):
-    .lph <attachment>              deobfuscate an attached file
+    .lph <attachment>              full devirtualization
     .lph <url>                     download and deobfuscate
-    .lph                           then paste the script on the following
-                                   line(s) — deobfuscate pasted text
+    .lph                           then paste the script on the next line(s)
+    .lph trace <attachment|url>    behavior-trace only (faster, less complete)
     .lph detect <attachment|url>   scan the header only
     .lph help
     .lph ping
@@ -115,7 +115,6 @@ def _channel_ok(message: discord.Message) -> bool:
 
 
 def _bad_ext(name: str) -> bool:
-    """Reject only obviously-not-source files. No extension is fine."""
     low = name.lower()
     if low.endswith(FORBIDDEN_SUFFIXES):
         return True
@@ -297,12 +296,6 @@ async def _resolve_source(
     message: discord.Message,
     source_text: str | None,
 ) -> tuple[bytes, str]:
-    """
-    Priority:
-        1. attachment
-        2. URL in `source_text`
-        3. inline pasted code in `source_text`
-    """
     # 1) attachment
     if message.attachments:
         att = message.attachments[0]
@@ -369,10 +362,12 @@ async def _run_job(
     note = describe_dispatch(info, None)
     header_line = info.get("banner") or "(no banner)"
 
+    mode_label = "full devirtualization" if mode == "full" else "behavior trace only"
     status = (
         f"**Detected:** {_scan_summary(info)}\n"
         f"**Banner:** `{header_line[:200]}`\n"
         f"**Input:** `{original_name}` ({_human_size(len(data))})\n"
+        f"**Mode:** {mode_label}\n"
         f"**Dispatch:** {note}"
     )
     await message.reply(status, mention_author=False)
@@ -413,9 +408,16 @@ async def _run_job(
             return
 
         if res.get("error"):
-            body = res["error"][:1800]
+            body = res["error"][:1600]
+            hint = (
+                ""
+                if mode == "trace"
+                else f"\n\nTip: try `{PREFIX} trace <same source>` for a "
+                     f"behavior-trace-only run (faster, sometimes succeeds when "
+                     f"full devirtualization fails)."
+            )
             await message.reply(
-                f"deobfuscation failed:\n```\n{body}\n```",
+                f"deobfuscation failed:\n```\n{body}\n```{hint}",
                 mention_author=False,
             )
             return
@@ -448,9 +450,10 @@ async def _run_job(
 
 HELP_TEXT = (
     f"**luraph deobfuscator**\n"
-    f"`{PREFIX} <attachment>` — deobfuscate an attached file\n"
-    f"`{PREFIX} <url>` — deobfuscate a file at a direct http(s) link\n"
+    f"`{PREFIX} <attachment>` — full devirtualization of an attached file\n"
+    f"`{PREFIX} <url>` — same, but download from an http(s) link\n"
     f"`{PREFIX}` then paste the script on the next line(s) — deobfuscate pasted text\n"
+    f"`{PREFIX} trace <attachment|url>` — behavior trace only (fast, less complete)\n"
     f"`{PREFIX} detect <attachment|url|text>` — scan the header only\n"
     f"`{PREFIX} help` — this message\n"
     f"`{PREFIX} ping` — health check\n"
@@ -508,13 +511,17 @@ async def on_message(message: discord.Message):
         await message.reply(HELP_TEXT, mention_author=False)
         return
 
-    # ---- figure out the source ----
+    # ---- figure out the source and mode ----
     detect_only = False
+    mode = "full"
     source_text = rest
 
     if first_token == "detect":
         detect_only = True
         source_text = rest[len("detect"):].strip()
+    elif first_token == "trace":
+        mode = "trace"
+        source_text = rest[len("trace"):].strip()
 
     # Bare ".lph" with no attachment -> help. With attachment -> process it.
     if not rest and not has_attachment:
@@ -571,7 +578,7 @@ async def on_message(message: discord.Message):
 
     _last_run[message.author.id] = time.time()
     try:
-        await _run_job(message, data, name, mode="full")
+        await _run_job(message, data, name, mode=mode)
     except Exception as e:  # noqa: BLE001
         try:
             await message.reply(f"job failed: `{e}`", mention_author=False)
