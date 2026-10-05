@@ -52,6 +52,8 @@ FORBIDDEN_SUFFIXES = (
     ".exe", ".dll", ".so", ".dylib",
     ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
     ".py", ".pyc", ".bat", ".cmd", ".ps1", ".sh", ".js",
+    ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".wav",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 )
 
 MAX_QUEUE_DEPTH = 32
@@ -113,9 +115,12 @@ def _channel_ok(message: discord.Message) -> bool:
 
 
 def _bad_ext(name: str) -> bool:
+    """Reject only obviously-not-source files. No extension is fine."""
     low = name.lower()
     if low.endswith(FORBIDDEN_SUFFIXES):
         return True
+    if "." not in low:
+        return False
     return not low.endswith(ALLOWED_SUFFIXES)
 
 
@@ -254,7 +259,6 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _extract_inline_source(text: str) -> str | None:
-    """Return the pasted script if `text` looks like one, else None."""
     if not text:
         return None
 
@@ -304,13 +308,21 @@ async def _resolve_source(
         att = message.attachments[0]
         if _bad_ext(att.filename):
             raise SourceError(
-                f"refusing `{att.filename}` — allowed: {', '.join(ALLOWED_SUFFIXES)}"
+                f"refusing `{att.filename}` — looks like a binary/archive.\n"
+                f"rename it to end in `.lua`, `.luau`, `.lph` or `.txt`, "
+                f"then re-send."
             )
         try:
             data = await att.read()
         except discord.HTTPException as e:
             raise SourceError(f"failed to download the attachment: `{e}`") from e
-        return data, att.filename
+
+        name = att.filename
+        low = name.lower()
+        if "." not in low or not low.endswith(ALLOWED_SUFFIXES):
+            stem = name.rsplit(".", 1)[0] if "." in name else name
+            name = (stem or "upload") + ".luau"
+        return data, name
 
     # 2) URL
     if source_text and _looks_like_url(source_text):
@@ -443,7 +455,7 @@ HELP_TEXT = (
     f"`{PREFIX} help` — this message\n"
     f"`{PREFIX} ping` — health check\n"
     f"`{PREFIX} stats` — queue depth and uptime\n\n"
-    f"accepted extensions: `{', '.join(ALLOWED_SUFFIXES)}`\n"
+    f"accepted extensions: `{', '.join(ALLOWED_SUFFIXES)}` (or no extension)\n"
     f"version is auto-detected from the file header — no engine argument needed.\n"
     f"*Pasted text is limited by Discord's message size (2000 chars, "
     f"4000 with Nitro) — larger scripts must be attached or hosted.*"
@@ -470,11 +482,9 @@ async def on_message(message: discord.Message):
 
     rest = message.content[len(PREFIX):].strip()
     first_token = rest.split(maxsplit=1)[0].lower() if rest else ""
+    has_attachment = bool(message.attachments)
 
-    if not rest or first_token in ("help", "h"):
-        await message.reply(HELP_TEXT, mention_author=False)
-        return
-
+    # ---- explicit subcommands ----
     if first_token == "ping":
         await message.reply("alive", mention_author=False)
         return
@@ -494,21 +504,25 @@ async def on_message(message: discord.Message):
         await message.reply(embed=embed, mention_author=False)
         return
 
+    if first_token in ("help", "h"):
+        await message.reply(HELP_TEXT, mention_author=False)
+        return
+
+    # ---- figure out the source ----
     detect_only = False
     source_text = rest
+
     if first_token == "detect":
         detect_only = True
         source_text = rest[len("detect"):].strip()
 
-    has_attachment = bool(message.attachments)
-
-    if not has_attachment and not source_text:
-        await message.reply(
-            f"nothing to deobfuscate — attach a file, paste a URL, "
-            f"or paste the script text.\ntry `{PREFIX} help`",
-            mention_author=False,
-        )
+    # Bare ".lph" with no attachment -> help. With attachment -> process it.
+    if not rest and not has_attachment:
+        await message.reply(HELP_TEXT, mention_author=False)
         return
+
+    if not source_text and has_attachment:
+        source_text = None
 
     left = _cooldown_left(message.author.id)
     if left > 0.5:
