@@ -2,7 +2,7 @@
 Discord bot for the Luraph deobfuscator — prefix commands, auto-detect.
 
 Usage (prefix is `.lph`):
-    .lph <attachment>              smart: full -> strings -> trace fallback
+    .lph <attachment>              smart: full → strings → trace fallback
     .lph <url>                     same, but download from an http(s) link
     .lph                           then paste the script on the next line(s)
     .lph full <attachment|url>     force full devirtualization only
@@ -46,6 +46,9 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 PREFIX = os.environ.get("PREFIX", ".lph")
 
+# extension used for the file sent back to Discord
+OUTPUT_EXT = ".lua"
+
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", 600))
 STARTED_AT = time.time()
 
@@ -67,8 +70,11 @@ ALLOWED_SCHEMES = {"http", "https"}
 USER_COOLDOWN = 10.0
 _last_run: dict[int, float] = {}
 
-# strip comment lines containing "oxy" anywhere (dsc.gg/oxyenv, oxygen, ...)
+# strip any comment line containing "oxy" (case-insensitive)
 _CLEAN_RE = re.compile(r"^\s*--.*?oxy", re.IGNORECASE)
+
+# detects a name that's just a hex job id
+_HEXLIKE_RE = re.compile(r"^[0-9a-fA-F]{6,40}$")
 
 # ---------------------------------------------------------------- channel lock
 
@@ -173,6 +179,30 @@ def _clean_output(text: str) -> str:
     if removed:
         print(f"[bot] stripped {removed} oxy comment line(s)", flush=True)
     return "\n".join(kept)
+
+
+def _output_name(original_name: str | None) -> str:
+    """
+    Turn any input name into `<stem>.deobf<OUTPUT_EXT>`.
+
+    OUTPUT_EXT is `.lua` by default. Change the constant at the top of
+    the file if you want a different extension.
+    """
+    stem = ""
+    if original_name:
+        try:
+            stem = Path(original_name).stem
+        except Exception:
+            stem = ""
+    stem = (stem or "").strip().rstrip(".")
+
+    if not stem or _HEXLIKE_RE.match(stem):
+        stem = "output"
+
+    safe = re.sub(r"[^\w.\- ]+", "", stem).strip().rstrip(".")
+    if not safe:
+        safe = "output"
+    return f"{safe}.deobf{OUTPUT_EXT}"
 
 
 # ---------------------------------------------------------------- SSRF
@@ -339,6 +369,7 @@ async def _resolve_source(
         if "." not in low or not low.endswith(ALLOWED_SUFFIXES):
             stem = name.rsplit(".", 1)[0] if "." in name else name
             name = (stem or "upload") + ".luau"
+        print(f"[bot] attachment input name: {name!r}", flush=True)
         return data, name
 
     # 2) URL
@@ -358,12 +389,14 @@ async def _resolve_source(
         if not low.endswith(ALLOWED_SUFFIXES):
             stem = tail.rsplit(".", 1)[0] if "." in tail else tail
             tail = (stem or "downloaded") + ".luau"
+        print(f"[bot] url input name: {tail!r} (from {final_url})", flush=True)
         return data, tail
 
     # 3) inline pasted code
     if source_text:
         body = _extract_inline_source(source_text)
         if body:
+            print("[bot] inline pasted source", flush=True)
             return body.encode("utf-8", "replace"), "pasted.luau"
 
     raise SourceError(
@@ -373,15 +406,6 @@ async def _resolve_source(
 
 
 # ---------------------------------------------------------------- job runner
-
-def _force_luau_name(original_name: str) -> str:
-    """Given any name, produce `<stem>.deobf.luau`."""
-    stem = Path(original_name).stem or "output"
-    if not stem:
-        stem = "output"
-    stem = stem.rstrip(".")
-    return f"{stem}.deobf.luau"
-
 
 async def _run_job(
     message: discord.Message,
@@ -440,16 +464,20 @@ async def _run_job(
             return
 
         if res.get("error"):
-            body = res["error"][:1600]
-            attempts = res.get("attempts")
-            hint = ""
+            body = res["error"][:1500]
+            attempts = res.get("attempts") or []
+            hint_parts = []
             if attempts:
-                hint = f"\n\nmodes tried: {', '.join(attempts)} — all failed."
-            if mode == "smart":
-                hint += (
-                    f"\n\nTip: try `{PREFIX} trace <same source>` to force a "
-                    f"pure behavior trace with no devirt attempt."
+                hint_parts.append(
+                    f"modes tried: **{', '.join(attempts)}** — all failed."
                 )
+            if mode == "smart":
+                hint_parts.append(
+                    f"try `{PREFIX} trace <same source>` to force a pure "
+                    f"behavior trace with no devirt attempt."
+                )
+            hint = ("\n\n" + "\n".join(hint_parts)) if hint_parts else ""
+
             await message.reply(
                 f"deobfuscation failed:\n```\n{body}\n```{hint}",
                 mention_author=False,
@@ -467,16 +495,21 @@ async def _run_job(
         text = _clean_output(text)
         payload = text.encode("utf-8")
 
-        name = _force_luau_name(original_name)
+        name = _output_name(original_name)
+        print(
+            f"[bot] output name: {name!r} (from input {original_name!r})",
+            flush=True,
+        )
 
         elapsed = res.get("elapsed", 0)
-        extra = ""
+        extra_parts = []
         rinfo = res.get("scan") or {}
         if rinfo.get("found"):
-            extra = f" · Luraph v{rinfo['version']}"
+            extra_parts.append(f"Luraph v{rinfo['version']}")
         used = res.get("mode_used")
         if used and used != mode:
-            extra += f" · used `{used}`"
+            extra_parts.append(f"used `{used}`")
+        extra = (" · " + " · ".join(extra_parts)) if extra_parts else ""
 
         await message.reply(
             content=f"done in {elapsed:.1f}s — {_human_size(len(payload))}{extra}",
@@ -530,7 +563,6 @@ async def on_message(message: discord.Message):
     first_token = rest.split(maxsplit=1)[0].lower() if rest else ""
     has_attachment = bool(message.attachments)
 
-    # ---- explicit subcommands ----
     if first_token == "ping":
         await message.reply("alive", mention_author=False)
         return
@@ -554,7 +586,6 @@ async def on_message(message: discord.Message):
         await message.reply(HELP_TEXT, mention_author=False)
         return
 
-    # ---- figure out the source and mode ----
     detect_only = False
     mode = "smart"
     source_text = rest
