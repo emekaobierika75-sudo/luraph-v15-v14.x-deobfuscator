@@ -8,14 +8,15 @@ Job JSON:
       "id": "abc123",
       "input": "/jobs/in/abc123.luau",
       "engine": "14.7" | "luraph_v15" | null,
-      "mode": "full" | "trace" | "strings" | "detect",
+      "mode": "smart" | "full" | "trace" | "strings" | "detect",
       "original_name": "sample.luau"
     }
 
 Result JSON:
-    {"output": "/jobs/out/abc123.luau", "elapsed": 12.3, "scan": {...}}
-    {"detected": "Luraph v14.7", "engine": "14.7", "banner": "...", "scan": {...}}
-    {"error": "..."}
+    {"output": "...", "elapsed": 12.3, "scan": {...}, "mode_used": "full",
+     "attempts": ["full"]}
+    {"error": "...", "attempts": ["full", "strings", "trace"], "scan": {...}}
+    {"detected": "Luraph v14.7", ...}
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -45,15 +47,52 @@ RUN_BUDGET = 25
 POLL_SECONDS = 0.5
 MAX_LOG_CHARS = 2000
 
+SMART_ORDER = ("full", "strings", "trace")
+
 
 def _log(msg: str) -> None:
     print(f"[worker] {msg}", flush=True)
+
+
+def _clean_traceback(text: str) -> str:
+    """
+    If stderr contains a Python traceback, drop the traceback frames and
+    keep only:
+      - the engine's own lines that came before the traceback
+      - the final exception line (the actual error message)
+    """
+    if "Traceback (most recent call last):" not in text:
+        return text
+
+    lines = text.split("\n")
+
+    # find the first traceback header
+    tb_start = None
+    for i, l in enumerate(lines):
+        if "Traceback (most recent call last):" in l:
+            tb_start = i
+            break
+
+    # last non-empty line is the exception summary
+    last = ""
+    for l in reversed(lines):
+        if l.strip():
+            last = l.strip()
+            break
+
+    if tb_start is None:
+        return text
+    head = "\n".join(lines[:tb_start]).rstrip()
+    if head:
+        return head + "\n\n" + last
+    return last
 
 
 def _read_stderr_tail(p: subprocess.CompletedProcess) -> str:
     err = p.stderr.decode("utf-8", "replace") if p.stderr else ""
     out = p.stdout.decode("utf-8", "replace") if p.stdout else ""
     text = err.strip() or out.strip() or f"exit code {p.returncode}"
+    text = _clean_traceback(text)
     return text[-MAX_LOG_CHARS:]
 
 
@@ -69,15 +108,21 @@ def _run_detect(inp: Path) -> dict:
     return {"error": "no Luraph banner found in the first 8 KB"}
 
 
-def _run_full(inp: Path, job: dict) -> dict:
-    job_id = job["id"]
-    mode = job.get("mode", "full")
-
-    work = WORK / job_id
+def _run_one(inp: Path, job: dict, mode: str, sub_id: str) -> dict:
+    """Run a single mode. Always returns a dict; never raises."""
+    work = WORK / sub_id
     work.mkdir(parents=True, exist_ok=True)
     out_file = work / "out.luau"
 
-    front, extra, scan_info = plan(inp, job.get("engine"), mode)
+    try:
+        front, extra, scan_info = plan(inp, job.get("engine"), mode)
+    except Exception as e:
+        shutil.rmtree(work, ignore_errors=True)
+        return {
+            "error": f"dispatch failed: {e!r}",
+            "scan": {},
+            "mode": mode,
+        }
 
     cmd = [
         sys.executable,
@@ -89,7 +134,7 @@ def _run_full(inp: Path, job: dict) -> dict:
         *extra,
     ]
 
-    _log(f"job {job_id}: {' '.join(cmd)}")
+    _log(f"job {sub_id}: mode={mode}: {' '.join(cmd)}")
     t0 = time.time()
 
     try:
@@ -106,23 +151,102 @@ def _run_full(inp: Path, job: dict) -> dict:
             },
         )
     except subprocess.TimeoutExpired:
-        _log(f"job {job_id}: killed after {HARD_TIMEOUT}s")
+        elapsed = time.time() - t0
+        _log(f"job {sub_id}: mode={mode}: killed after {HARD_TIMEOUT}s")
         shutil.rmtree(work, ignore_errors=True)
-        return {"error": f"deobfuscator killed after {HARD_TIMEOUT}s", "scan": scan_info}
+        return {
+            "error": f"deobfuscator killed after {HARD_TIMEOUT}s (mode={mode})",
+            "scan": scan_info,
+            "mode": mode,
+            "elapsed": elapsed,
+        }
+    except Exception as e:
+        elapsed = time.time() - t0
+        _log(f"job {sub_id}: mode={mode}: subprocess exception {e!r}")
+        shutil.rmtree(work, ignore_errors=True)
+        return {
+            "error": f"subprocess error: {e!r}",
+            "scan": scan_info,
+            "mode": mode,
+            "elapsed": elapsed,
+        }
 
     elapsed = time.time() - t0
 
     if p.returncode != 0 or not out_file.exists():
         err = _read_stderr_tail(p)
-        _log(f"job {job_id}: failed ({elapsed:.1f}s)")
+        _log(f"job {sub_id}: mode={mode}: failed ({elapsed:.1f}s)")
         shutil.rmtree(work, ignore_errors=True)
-        return {"error": err, "scan": scan_info}
+        return {
+            "error": err,
+            "scan": scan_info,
+            "mode": mode,
+            "elapsed": elapsed,
+        }
 
-    final = OUT / f"{job_id}.luau"
+    final = OUT / f"{sub_id}.luau"
     shutil.copyfile(out_file, final)
     shutil.rmtree(work, ignore_errors=True)
-    _log(f"job {job_id}: ok ({elapsed:.1f}s, {final.stat().st_size} bytes)")
-    return {"output": str(final), "elapsed": elapsed, "scan": scan_info}
+    _log(f"job {sub_id}: mode={mode}: ok ({elapsed:.1f}s, {final.stat().st_size} bytes)")
+    return {
+        "output": str(final),
+        "elapsed": elapsed,
+        "scan": scan_info,
+        "mode": mode,
+    }
+
+
+def _run_smart(inp: Path, job: dict) -> dict:
+    """
+    Try each mode in SMART_ORDER. Return the first success; if all fail,
+    return a merged error naming every mode that was attempted.
+    """
+    base_id = job["id"]
+    attempts: list[str] = []
+    last_err = ""
+    last_scan: dict = {}
+    total_start = time.time()
+    per_mode_errors: list[tuple[str, str]] = []
+
+    for i, mode in enumerate(SMART_ORDER):
+        sub_id = f"{base_id}.{i}.{mode}"
+        try:
+            result = _run_one(inp, job, mode, sub_id)
+        except Exception as e:  # noqa: BLE001
+            _log(f"job {base_id}: mode={mode}: crashed in _run_one: {e!r}")
+            traceback.print_exc()
+            result = {"error": f"internal error in mode {mode}: {e!r}", "mode": mode}
+
+        attempts.append(mode)
+        last_scan = result.get("scan") or last_scan
+
+        if "output" in result:
+            result["mode_used"] = mode
+            result["elapsed"] = time.time() - total_start
+            result["attempts"] = attempts
+            return result
+
+        err = result.get("error", "")
+        per_mode_errors.append((mode, err))
+        last_err = err
+        sub_out = OUT / f"{sub_id}.luau"
+        sub_out.unlink(missing_ok=True)
+
+    # all modes failed: build a compact report
+    if per_mode_errors:
+        parts = []
+        for mode, err in per_mode_errors:
+            first_line = (err.splitlines()[0] if err.splitlines() else "unknown error")
+            parts.append(f"[{mode}] {first_line}")
+        summary = "\n".join(parts)
+    else:
+        summary = last_err or "all modes failed"
+
+    return {
+        "error": summary,
+        "attempts": attempts,
+        "scan": last_scan,
+    }
 
 
 def run_job(job: dict) -> dict:
@@ -130,12 +254,15 @@ def run_job(job: dict) -> dict:
     if not inp.exists():
         return {"error": f"input file vanished: {inp}"}
 
-    mode = job.get("mode", "full")
+    mode = job.get("mode", "smart")
     try:
         if mode == "detect":
             return _run_detect(inp)
-        return _run_full(inp, job)
-    except Exception as e:
+        if mode == "smart":
+            return _run_smart(inp, job)
+        return _run_one(inp, job, mode, job["id"])
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
         return {"error": f"worker exception: {e!r}"}
 
 
@@ -165,6 +292,7 @@ def main() -> None:
     WORK.mkdir(parents=True, exist_ok=True)
 
     _log(f"watching {IN} (jobs out -> {OUT})")
+    _log(f"smart mode order: {' -> '.join(SMART_ORDER)}")
 
     while True:
         found = False
